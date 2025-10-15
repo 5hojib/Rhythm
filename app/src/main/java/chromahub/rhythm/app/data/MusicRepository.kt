@@ -1028,19 +1028,27 @@ class MusicRepository(context: Context) {
      * ID3v2.3/v2.4 tags with USLT frames are the most reliable format.
      */
     private fun getEmbeddedLyrics(songUri: Uri): LyricsData? {
-        // Try MediaMetadataRetriever first (fastest)
+        // Try MediaMetadataRetriever first (fastest and most standard way)
         val retrieverLyrics = extractLyricsViaRetriever(songUri)
-        if (retrieverLyrics != null) return retrieverLyrics
+        if (retrieverLyrics != null) {
+            Log.d(TAG, "Successfully extracted lyrics via MediaMetadataRetriever.")
+            return retrieverLyrics
+        }
         
-        // Try direct file reading for ID3 tags
+        // As a fallback, try direct file reading for ID3 tags
         val id3Lyrics = extractLyricsFromID3(songUri)
-        if (id3Lyrics != null) return id3Lyrics
+        if (id3Lyrics != null) {
+            Log.d(TAG, "Successfully extracted lyrics via direct ID3 tag parsing.")
+            return id3Lyrics
+        }
         
+        Log.d(TAG, "No embedded lyrics found for URI: $songUri")
         return null
     }
     
     /**
-     * Attempts to extract lyrics using MediaMetadataRetriever
+     * Attempts to extract lyrics using MediaMetadataRetriever. This is the preferred
+     * method as it's handled by the Android system.
      */
     private fun extractLyricsViaRetriever(songUri: Uri): LyricsData? {
         var retriever: android.media.MediaMetadataRetriever? = null
@@ -1247,79 +1255,81 @@ class MusicRepository(context: Context) {
      * @param sourcePreference User's preferred lyrics source order
      */
     suspend fun fetchLyrics(
-        artist: String, 
-        title: String, 
+        artist: String,
+        title: String,
         songId: String? = null,
         songUri: Uri? = null,
         sourcePreference: LyricsSourcePreference = LyricsSourcePreference.API_FIRST
     ): LyricsData? = withContext(Dispatchers.IO) {
-        if (artist.isBlank() || title.isBlank())
+        if (artist.isBlank() || title.isBlank()) {
+            Log.w(TAG, "Cannot fetch lyrics for blank artist or title.")
             return@withContext LyricsData("No lyrics available for this song", null, null)
+        }
 
-        // Use song ID in cache key if available to prevent wrong lyrics for songs with similar metadata
         val cacheKey = if (songId != null) {
             "$songId:$artist:$title".lowercase()
         } else {
             "$artist:$title".lowercase()
         }
-        
-        lyricsCache[cacheKey]?.let { 
+
+        lyricsCache[cacheKey]?.let {
             Log.d(TAG, "Returning cached lyrics for: $artist - $title")
-            return@withContext it 
+            return@withContext it
         }
 
-        // Define source fetchers
-        val fetchFromLocal: suspend () -> LyricsData? = {
-            findLocalLyrics(artist, title)
+        Log.d(TAG, "Fetching lyrics for '$title' by '$artist'. Source preference: $sourcePreference")
+        if (songUri == null) {
+            Log.w(TAG, "Song URI is null, cannot fetch embedded lyrics.")
         }
-        
-        val fetchFromEmbedded: suspend () -> LyricsData? = {
-            songUri?.let { uri -> getEmbeddedLyrics(uri) }
+
+        val sourcesInOrder = when (sourcePreference) {
+            LyricsSourcePreference.API_FIRST -> listOf("API", "Embedded", "Local")
+            LyricsSourcePreference.EMBEDDED_FIRST -> listOf("Embedded", "API", "Local")
+            LyricsSourcePreference.LOCAL_FIRST -> listOf("Local", "Embedded", "API")
         }
-        
-        val fetchFromAPI: suspend () -> LyricsData? = {
-            if (isNetworkAvailable()) {
-                fetchLyricsFromAPIs(artist, title)
-            } else {
-                null
-            }
-        }
-        
-        // Try sources in order based on preference, with fallback to others
-        val sourceFetchers = when (sourcePreference) {
-            LyricsSourcePreference.API_FIRST -> listOf(fetchFromAPI, fetchFromEmbedded, fetchFromLocal)
-            LyricsSourcePreference.EMBEDDED_FIRST -> listOf(fetchFromEmbedded, fetchFromAPI, fetchFromLocal)
-            LyricsSourcePreference.LOCAL_FIRST -> listOf(fetchFromLocal, fetchFromEmbedded, fetchFromAPI)
-        }
-        
-        // Try each source in order until we find lyrics
-        for ((index, fetcher) in sourceFetchers.withIndex()) {
-            try {
-                val lyrics = fetcher()
-                if (lyrics != null && lyrics.hasLyrics()) {
-                    val sourceName = when (sourceFetchers[index]) {
-                        fetchFromAPI -> "API"
-                        fetchFromEmbedded -> "Embedded"
-                        fetchFromLocal -> "Local"
-                        else -> "Unknown"
+
+        for (source in sourcesInOrder) {
+            Log.d(TAG, "Trying source: $source")
+            val lyrics: LyricsData? = try {
+                when (source) {
+                    "API" -> {
+                        if (isNetworkAvailable()) {
+                            fetchLyricsFromAPIs(artist, title)
+                        } else {
+                            Log.d(TAG, "Network not available, skipping API fetch.")
+                            null
+                        }
                     }
-                    Log.d(TAG, "Found lyrics from $sourceName for: $artist - $title")
-                    lyricsCache[cacheKey] = lyrics
-                    if (sourceName == "API") {
-                        // Only save API-fetched lyrics to local cache
-                        saveLocalLyrics(artist, title, lyrics)
+                    "Embedded" -> {
+                        songUri?.let { getEmbeddedLyrics(it) }
                     }
-                    return@withContext lyrics
+                    "Local" -> {
+                        findLocalLyrics(artist, title)
+                    }
+                    else -> null
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Error fetching from source ${index + 1}: ${e.message}")
-                // Continue to next source
+                Log.w(TAG, "Error fetching lyrics from source '$source'", e)
+                null
+            }
+
+            if (lyrics != null && lyrics.hasLyrics()) {
+                Log.d(TAG, "Success! Found lyrics from $source for: $artist - $title")
+                lyricsCache[cacheKey] = lyrics
+                if (source == "API") {
+                    saveLocalLyrics(artist, title, lyrics)
+                }
+                return@withContext lyrics
+            } else {
+                Log.d(TAG, "No lyrics found from source: $source")
             }
         }
 
         // No lyrics found from any source
         Log.d(TAG, "No lyrics found from any source for: $artist - $title")
-        return@withContext LyricsData("No lyrics found for this song", null, null)
+        val notFoundLyrics = LyricsData("No lyrics found for this song", null, null)
+        lyricsCache[cacheKey] = notFoundLyrics
+        return@withContext notFoundLyrics
     }
     
     /**
